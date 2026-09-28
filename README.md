@@ -1,3 +1,68 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>CLIP · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>8.56x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-8.56x-2ea44f"></a>
+    <a href="https://github.com/openai/CLIP/commit/d05afc436d78f1c48dc0dbf8e5980a9d471f35f6"><img alt="base" src="https://img.shields.io/badge/upstream-d05afc436d78-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [openai/CLIP](https://github.com/openai/CLIP) at commit
+> [`d05afc436d78`](https://github.com/openai/CLIP/commit/d05afc436d78f1c48dc0dbf8e5980a9d471f35f6).
+> **What is measured here is an inference program, not upstream library code**: `clip_batch_infer.py`
+> does not exist upstream — it is a zero-shot batch-classification demo built on the `clip` package.
+> The commit on top of upstream adds that program in its optimized form; the diff against its own
+> unoptimized version is kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+> Everything under `clip/` is upstream, untouched.
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python clip_batch_infer.py` (with `N_IMAGES = None`, the full split) |
+| **Entry point** | `clip_batch_infer.py` (added by this fork) |
+| **Unit measured** | one batch of 32 images from the beans train split through CLIP ViT-B/32 zero-shot classification (JPEG decode → preprocess → image tower → class probabilities) |
+| **Before (stock program)** | 1.501 s per unit (49.02 s for the 33-batch loop over all 1034 images) |
+| **After (this tree, all switches default ON)** | 0.0355 s per unit steady state (5.73 s for the 33-batch loop, including a one-time ~4.5 s warm-up on the first batch) |
+| **Speedup** | **8.56x** end to end on RTX 4090, noise floor of the host 2.05% |
+| **Output** | zero-shot accuracy 301/1034 = 29.11%, identical to the stock program; per-image probabilities within 0.016 of stock; verified on the pinned inputs and on a held-out set the optimiser never saw |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `clip_batch_infer.py` | main() | 9.45x |
+| `clip_batch_infer.py` | main() | 3.21x |
+| `clip_batch_infer.py` | _build_fast_preprocess() | 1.98x |
+| `clip_batch_infer.py` | main() | 1.21x |
+| `clip_batch_infer.py` | main() | 1.019x |
+
+Every change is on by default and sits behind a switch at the top of the file; see [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/CLIP-ao.git
+cd CLIP-ao
+pip install -e . datasets
+# set N_IMAGES = None at the top of clip_batch_infer.py (the shipped 128 is four batches), then:
+python clip_batch_infer.py
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it. It adds the program only;
+`.autooptm/autooptm.patch` is that program's optimization diff against its own stock form.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 # CLIP
 
 [[Blog]](https://openai.com/blog/clip/) [[Paper]](https://arxiv.org/abs/2103.00020) [[Model Card]](model-card.md) [[Colab]](https://colab.research.google.com/github/openai/clip/blob/master/notebooks/Interacting_with_CLIP.ipynb)

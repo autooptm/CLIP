@@ -1,0 +1,154 @@
+diff --git a/clip_batch_infer.py b/clip_batch_infer.py
+index 47971ba37e020514439de3268fa0b3fcaa8177bb..f065803212e4b8d0c36f80e7148335fc029f1aaf 100644
+--- a/clip_batch_infer.py
++++ b/clip_batch_infer.py
+@@ -26,6 +26,12 @@ N_IMAGES = 128            # the demo takes the first 128; None runs all 1022
+ OUTPUT_FILE = "clip_results.tsv"
+ # ==============================
+ 
++_AO = os.environ.get("AUTOOPTM", "1") != "0"
++_AO_OPT_1 = _AO and os.environ.get("AO_OPT_1", "1") != "0"
++_AO_OPT_2 = _AO and os.environ.get("AO_OPT_2", "1") != "0"
++_AO_OPT_3 = int(os.environ.get("AO_OPT_3", "1" if _AO else "0"))
++_AO_OPT_4 = int(os.environ.get("AO_OPT_4", "40" if _AO_OPT_1 else "8") if _AO else "0")
++
+ # class name -> CLIP prompt (zero-shot accuracy depends on the wording)
+ PROMPTS = {
+     "angular_leaf_spot": "a photo of a bean leaf with angular leaf spot disease",
+@@ -33,13 +39,55 @@ PROMPTS = {
+     "healthy": "a photo of a healthy green bean leaf",
+ }
+ 
++_MEAN = (0.48145466, 0.4578275, 0.40821073)
++_STD = (0.26862954, 0.26130258, 0.27577711)
++
++
++def _build_fast_preprocess(device, resolution):
++    try:
++        from torchvision.io import ImageReadMode, decode_jpeg
++        from torchvision.transforms import InterpolationMode
++        from torchvision.transforms.v2 import functional as TF
++    except Exception:
++        return None
++
++    mean = torch.tensor(_MEAN, device=device).view(1, 3, 1, 1)
++    std = torch.tensor(_STD, device=device).view(1, 3, 1, 1)
++
++    def prep_one(record):
++        data = record.get("bytes") if isinstance(record, dict) else None
++        if data is None and isinstance(record, dict) and record.get("path"):
++            with open(record["path"], "rb") as fh:
++                data = fh.read()
++        x = decode_jpeg(torch.frombuffer(bytearray(data), dtype=torch.uint8),
++                        mode=ImageReadMode.RGB)
++        x = TF.resize(x, resolution, interpolation=InterpolationMode.BICUBIC, antialias=True)
++        return TF.center_crop(x, [resolution, resolution])
++
++    def finish_batch(tensors):
++        batch = torch.stack(tensors).to(device, non_blocking=True)
++        return batch.float().div_(255.0).sub_(mean).div_(std)
++
++    return prep_one, finish_batch
++
+ 
+ def main():
+     device = "cuda" if torch.cuda.is_available() else (
+         "mps" if torch.backends.mps.is_available() else "cpu")
+     print(f"device = {device}, model = {MODEL_NAME}")
++
++    if _AO_OPT_3 > 0:
++        torch.set_num_threads(_AO_OPT_3)
++
+     model, preprocess = clip.load(MODEL_NAME, device=device)
+ 
++    if _AO_OPT_2 and device == "cuda":
++        try:
++            from clip.model import ResidualAttentionBlock
++            ResidualAttentionBlock.forward = torch.compile(ResidualAttentionBlock.forward)
++        except Exception:
++            pass
++
+     ds = load_dataset("beans", split="train")
+     if N_IMAGES:
+         ds = ds.select(range(min(N_IMAGES, len(ds))))
+@@ -54,29 +102,57 @@ def main():
+         text_features = model.encode_text(text)
+         text_features /= text_features.norm(dim=-1, keepdim=True)
+ 
++    pool = None
++    if _AO_OPT_4 > 0:
++        from concurrent.futures import ThreadPoolExecutor
++        pool = ThreadPoolExecutor(max_workers=_AO_OPT_4)
++
++    fast = _build_fast_preprocess(device, model.visual.input_resolution) if _AO_OPT_1 else None
++    if fast is not None:
++        prep_one, finish_batch = fast
++        ds_src = ds.cast_column("image", ds.features["image"].__class__(decode=False))
++    else:
++        ds_src = ds
++
++        def prep_one(image):
++            return preprocess(image.convert("RGB"))
++
++        def finish_batch(tensors):
++            return torch.stack(tensors).to(device)
++
++    def prep_safe(item):
++        try:
++            return prep_one(item)
++        except Exception:
++            return None
++
+     results, correct, total, skipped = [], 0, 0, 0
+     for start in range(0, len(ds), BATCH_SIZE):
+-        batch = ds.select(range(start, min(start + BATCH_SIZE, len(ds))))
++        batch = ds_src.select(range(start, min(start + BATCH_SIZE, len(ds))))
++        items, labels_in = batch["image"], batch["labels"]
++        prepped = list(pool.map(prep_safe, items)) if pool else [prep_safe(i) for i in items]
++
+         imgs, labels = [], []
+-        for image, label in zip(batch["image"], batch["labels"]):
+-            try:
+-                imgs.append(preprocess(image.convert("RGB")))
+-                labels.append(label)
+-            except Exception:
+-                skipped += 1  # skip unreadable images
++        for tensor, label in zip(prepped, labels_in):
++            if tensor is None:
++                skipped += 1
++                continue
++            imgs.append(tensor)
++            labels.append(label)
+         if not imgs:
+             continue
+ 
+-        image_input = torch.stack(imgs).to(device)
++        image_input = finish_batch(imgs)
+         with torch.no_grad():
+             image_features = model.encode_image(image_input)
+             image_features /= image_features.norm(dim=-1, keepdim=True)
+-            probs = (100.0 * image_features @ text_features.T) \
+-                .softmax(dim=-1).cpu()
++            probs_dev = (100.0 * image_features @ text_features.T).softmax(dim=-1)
++            rows = torch.cat([probs_dev.float(),
++                              probs_dev.argmax(dim=-1, keepdim=True).float()], dim=1).tolist()
+ 
+-        for j, (row, label) in enumerate(zip(probs, labels)):
+-            pred = int(row.argmax())
+-            conf = float(row[pred])
++        for j, (row, label) in enumerate(zip(rows, labels)):
++            pred = int(row[-1])
++            conf = row[pred]
+             correct += int(pred == label)
+             total += 1
+             results.append(
+@@ -85,6 +161,9 @@ def main():
+         print(f"[{min(start + BATCH_SIZE, len(ds))}/{len(ds)}] "
+               f"running acc = {correct / total:.2%}")
+ 
++    if pool is not None:
++        pool.shutdown()
++
+     with open(OUTPUT_FILE, "w") as f:
+         f.write("\n".join(results))
+ 
